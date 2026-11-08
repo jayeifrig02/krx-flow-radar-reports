@@ -1,0 +1,57 @@
+name: KRX authenticated data check
+on:
+  workflow_dispatch:
+    inputs:
+      date:
+        description: 'Trading date (YYYYMMDD)'
+        required: true
+        type: string
+permissions:
+  contents: read
+concurrency:
+  group: krx-authenticated-check
+  cancel-in-progress: false
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Install provider
+        run: python3 -m pip install --quiet pykrx==1.2.9
+      - name: Verify raw price and detailed investor volumes
+        env:
+          KRX_ID: ${{ secrets.KRX_ID }}
+          KRX_PW: ${{ secrets.KRX_PW }}
+          PROBE_DATE: ${{ inputs.date }}
+        run: |
+          python3 - <<'PY'
+          import os, io, contextlib, logging, signal, json, sys
+          from datetime import datetime
+          date=os.environ.get('PROBE_DATE','')
+          try:
+              assert len(date)==8 and datetime.strptime(date,'%Y%m%d').strftime('%Y%m%d')==date
+          except Exception:
+              print('invalid_date');sys.exit(1)
+          if not os.environ.get('KRX_ID') or not os.environ.get('KRX_PW'):
+              print('credentials_missing');sys.exit(1)
+          def timeout(*_): raise TimeoutError()
+          signal.signal(signal.SIGALRM,timeout);signal.alarm(240)
+          logging.disable(logging.CRITICAL)
+          results=[]
+          try:
+              with contextlib.redirect_stdout(io.StringIO()),contextlib.redirect_stderr(io.StringIO()):
+                  from pykrx.website.comm.auth import get_auth_session
+                  from pykrx import stock
+                  if get_auth_session() is None: raise RuntimeError()
+                  for code in ['403870','080220','353200']:
+                      price=stock.get_market_ohlcv_by_date(date,date,code,adjusted=False)
+                      flow=stock.get_market_trading_volume_by_date(date,date,code,on='순매수',detail=True)
+                      results.append({'code':code,'raw_price_available':not price.empty,'flow_available':not flow.empty and {'투신','사모','연기금'}.issubset(flow.columns)})
+              ok=all(r['raw_price_available'] and r['flow_available'] for r in results)
+              print(json.dumps({'status':'passed' if ok else 'data_unavailable','date':date,'results':results}))
+              sys.exit(0 if ok else 1)
+          except Exception as e:
+              print(json.dumps({'status':'failed','error_type':type(e).__name__}));sys.exit(1)
+          finally:
+              signal.alarm(0)
+          PY
